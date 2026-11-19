@@ -991,6 +991,35 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 		}
 		drain();
 	} while (normalized);
+	// Any packed ancillary read that is not a single SampleId/Layer bitfield extract (masks,
+	// shifts, whole-dword moves) has no direct Vulkan input. Rebuild the RDNA 2 packed dword
+	// from the typed inputs instead: [11:8] sample index, [26:16] render-target array index.
+	// The primitive-type bits [1:0] are not exposed by Vulkan and read as zero.
+	bool expanded_ancillary = false;
+	for (auto* block: blocks) {
+		for (auto inst = block->begin(); inst != block->end(); ++inst) {
+			if (inst->GetOpcode() != ValueOpcode::GetBuiltin || !inst->HasUses() ||
+			    inst->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::PackedAncillary))) {
+				continue;
+			}
+			const auto layer = worklist.Prepend(
+			    *block, inst, ValueOpcode::GetBuiltin,
+			    {Value(static_cast<uint32_t>(StageInputKind::Layer)), Value(0u)});
+			const auto sample = worklist.Prepend(
+			    *block, inst, ValueOpcode::GetBuiltin,
+			    {Value(static_cast<uint32_t>(StageInputKind::SampleId)), Value(0u)});
+			const auto layer_bits = worklist.Prepend(*block, inst, ValueOpcode::ShiftLeftLogical32,
+			                                         {Value(&*layer), Value(16u)});
+			const auto sample_bits = worklist.Prepend(*block, inst, ValueOpcode::ShiftLeftLogical32,
+			                                          {Value(&*sample), Value(8u)});
+			const auto packed = worklist.Prepend(*block, inst, ValueOpcode::BitwiseOr32,
+			                                     {Value(&*layer_bits), Value(&*sample_bits)});
+			worklist.QueueUsers(inst->Uses());
+			Replace(*inst, Value(&*packed));
+			expanded_ancillary = true;
+		}
+	}
+	if (expanded_ancillary) drain();
 	// Repeated register reads share a bitcast only within the same SSA block.
 	std::unordered_map<const Inst*, Inst*> bitcasts;
 	for (auto* block: blocks) {
