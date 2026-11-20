@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -101,6 +102,18 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		return limit;
 	}();
 	if (program.stage != ShaderType::Mesh) state.loop_guard_limit = loop_guard;
+	// PPSA02530's persistent GPU-culling compute shader walks its Hi-Z footprint with float loop
+	// counters (x += 1.0 / x += 8.0 while x <= max). When a projected bound comes out infinite
+	// the counter stops changing and the loop never ends, hanging the GPU (device lost). Give
+	// this one shader a loop budget unless KYTY_LOOP_GUARD already set one.
+	if (state.loop_guard_limit == 0 && program.shader_hash == 0x8556beb2a0abb67aull) {
+		state.loop_guard_limit = 200000u;
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true)) {
+			Log::WriteToConsoleAndLog(
+			    "Shader recompiler: loop guard 200000 for CS 0x8556beb2a0abb67a\n");
+		}
+	}
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
