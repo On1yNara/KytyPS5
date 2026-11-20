@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/checkpoints.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -723,6 +724,19 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		}
 	}
 	LOGF("Vulkan device fault reporting: %s\n", graphics.device_fault_enabled ? "true" : "false");
+	// Diagnostics only: numbered markers before every draw and dispatch let a lost device tell
+	// which shader the GPU was running (see renderer/checkpoints.h).
+	if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+		device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		Checkpoints::g_enabled = true;
+	}
+	{
+		auto& device_info                    = create.get<vk::DeviceCreateInfo>();
+		device_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
+		device_info.ppEnabledExtensionNames = device_extensions.data();
+	}
+	Log::WriteToConsoleAndLog(Checkpoints::g_enabled ? "Vulkan GPU checkpoints: on\n"
+	                                                 : "Vulkan GPU checkpoints: not available\n");
 
 	vk::Device device = nullptr;
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),

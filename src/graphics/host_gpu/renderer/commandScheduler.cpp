@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/checkpoints.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -347,6 +348,54 @@ static void LogDeviceFault(const GraphicContext& graphics) {
 	Log::WriteToConsoleAndLog(text);
 }
 
+// Prints the GPU checkpoints (renderer/checkpoints.h) of a lost device: the last draw or dispatch
+// each pipeline stage reached. The work that hung started (top of pipe) but never finished
+// (bottom of pipe), so everything between the two markers is listed.
+static void LogCheckpoints(const GraphicContext& graphics) {
+	if (!Checkpoints::g_enabled ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV == nullptr) {
+		Log::WriteToConsoleAndLog("GPU checkpoints: not available\n");
+		return;
+	}
+	const auto queue = static_cast<VkQueue>(graphics.queue);
+	uint32_t   count = 0;
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(queue, &count, nullptr);
+	std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV {VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+	if (count != 0) {
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(queue, &count, data.data());
+	}
+	const auto describe = [](uint64_t seq) {
+		char line[160];
+		if (const auto* entry = Checkpoints::Find(seq)) {
+			snprintf(line, sizeof(line), "#%" PRIu64 " %s cs/vs=0x%016" PRIx64 " ps=0x%016" PRIx64,
+			         seq,
+			         entry->kind == 'D'   ? "draw"
+			         : entry->kind == 'I' ? "dispatch-indirect"
+			                              : "dispatch",
+			         entry->first_hash, entry->second_hash);
+		} else {
+			snprintf(line, sizeof(line), "#%" PRIu64 " (not in table)", seq);
+		}
+		return std::string(line);
+	};
+	std::string text = "--- GPU checkpoints ---\n";
+	uint64_t    lowest = UINT64_MAX, highest = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const auto seq = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+		text += "Stage " + vk::to_string(static_cast<vk::PipelineStageFlags>(data[i].stage)) +
+		        ": " + describe(seq) + "\n";
+		lowest  = std::min(lowest, seq);
+		highest = std::max(highest, seq);
+	}
+	if (count != 0 && highest > lowest) {
+		text += "In flight when the GPU hung:\n";
+		for (uint64_t seq = lowest + 1; seq <= highest && seq <= lowest + 32; seq++) {
+			text += "  " + describe(seq) + "\n";
+		}
+	}
+	Log::WriteToConsoleAndLog(text);
+}
+
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
@@ -385,6 +434,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	if (result != vk::Result::eSuccess) {
 		if (result == vk::Result::eErrorDeviceLost) {
 			LogDeviceFault(graphics);
+			LogCheckpoints(graphics);
 		}
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}

@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/checkpoints.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -1208,6 +1209,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	Checkpoints::Mark(vk_buffer, 'D', state.vertex_info[0].stage.module->info.shader_hash,
+	                  state.ps_active && state.ps_input_info.stage.module != nullptr
+	                      ? state.ps_input_info.stage.module->info.shader_hash
+	                      : 0);
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
