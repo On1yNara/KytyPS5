@@ -41,12 +41,12 @@ public:
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
 	                        IR::Block& info);
-	// Experimental (KYTY_EXECZ_BARRIER_FIX=1): S_CBRANCH_EXECZ never jumps in workgroup shaders
-	// that use S_BARRIER. RDNA lets a wave with no active lanes skip a region that holds a barrier
-	// (the barrier only waits for waves that still run), but a Vulkan control barrier must be
-	// reached by every invocation of the workgroup, so the skipping wave leaves the others waiting
-	// forever. Falling through runs the region with EXEC = 0: vector work stays masked off and the
-	// wave takes part in the barrier.
+	// Experimental (KYTY_EXECZ_BARRIER_FIX=1): this block's S_CBRANCH_EXECZ is a forward skip over
+	// an S_BARRIER (and not a loop exit), so it never jumps. RDNA lets a wave with no active lanes
+	// skip a region that holds a barrier (the barrier only waits for waves that still run), but a
+	// Vulkan control barrier must be reached by every invocation of the workgroup, so the skipping
+	// wave leaves the others waiting forever. Falling through runs the region with EXEC = 0:
+	// vector work stays masked off and the wave takes part in the barrier.
 	bool execz_never_taken = false;
 
 private:
