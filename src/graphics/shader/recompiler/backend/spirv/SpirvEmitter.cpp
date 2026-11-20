@@ -83,6 +83,12 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	        ? 2u
 	        : 1u;
 	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
+	// Same idea as AnyPS5's APS5_LOOP_GUARD. Mesh shaders are skipped: their SPIR-V 1.4 entry point
+	// would have to list the counter variable in its interface.
+	if (const char* guard = std::getenv("KYTY_LOOP_GUARD");
+	    guard != nullptr && program.stage != ShaderType::Mesh) {
+		state.loop_guard_limit = static_cast<uint32_t>(std::strtoul(guard, nullptr, 0));
+	}
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
