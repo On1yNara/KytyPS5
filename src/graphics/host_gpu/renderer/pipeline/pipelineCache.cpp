@@ -136,7 +136,9 @@ void DumpShader(std::span<const uint32_t> words, const std::string& name) {
 // Diagnostics: always dumps the shaders being investigated to _ShaderDump, without the full
 // graphics debug dump. KYTY_DUMP_SHADER=<hex hash>[,<hex hash>...] or "all" adds more.
 bool ShaderDumpRequested(uint64_t hash) {
-	if (hash == 0x8556beb2a0abb67aull || hash == 0xc9216bf2a1a89c28ull) return true;
+	if (hash == 0x8556beb2a0abb67aull || hash == 0xc9216bf2a1a89c28ull ||
+	    hash == 0x11ac0502b89a6dd2ull)
+		return true;
 	static const std::string requested = [] {
 		const char* value = std::getenv("KYTY_DUMP_SHADER");
 		return std::string(value != nullptr ? value : "");
