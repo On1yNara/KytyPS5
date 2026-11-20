@@ -2,9 +2,13 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <string>
+#include <vector>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -302,6 +306,47 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	return m_command;
 }
 
+// Asks the driver what the GPU faulted on (VK_EXT_device_fault) and writes it to the log, so a
+// lost device says more than ErrorDeviceLost.
+static void LogDeviceFault(const GraphicContext& graphics) {
+	if (!graphics.device_fault_enabled) {
+		Log::WriteToConsoleAndLog("Device fault: VK_EXT_device_fault not available on this GPU\n");
+		return;
+	}
+	vk::DeviceFaultCountsEXT counts {};
+	if (graphics.device.getFaultInfoEXT(&counts, nullptr) != vk::Result::eSuccess &&
+	    counts.addressInfoCount == 0 && counts.vendorInfoCount == 0) {
+		Log::WriteToConsoleAndLog("Device fault: the driver returned no fault information\n");
+		return;
+	}
+	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+	counts.vendorBinarySize = 0;
+	vk::DeviceFaultInfoEXT info {};
+	info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+	info.pVendorInfos  = vendors.empty() ? nullptr : vendors.data();
+	const auto result  = graphics.device.getFaultInfoEXT(&counts, &info);
+	std::string text   = "--- Device fault (" + vk::to_string(result) + ") ---\n";
+	text += std::string("Description: ") + info.description.data() + "\n";
+	for (uint32_t i = 0; i < counts.addressInfoCount && i < addresses.size(); i++) {
+		const auto& a = addresses[i];
+		char line[160];
+		snprintf(line, sizeof(line), "Address: %s at 0x%016" PRIx64 " (precision 0x%" PRIx64 ")\n",
+		         vk::to_string(a.addressType).c_str(), static_cast<uint64_t>(a.reportedAddress),
+		         static_cast<uint64_t>(a.addressPrecision));
+		text += line;
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendors.size(); i++) {
+		const auto& v = vendors[i];
+		char line[320];
+		snprintf(line, sizeof(line), "Vendor: %s (code 0x%" PRIx64 ", data 0x%" PRIx64 ")\n",
+		         v.description.data(), static_cast<uint64_t>(v.vendorFaultCode),
+		         static_cast<uint64_t>(v.vendorFaultData));
+		text += line;
+	}
+	Log::WriteToConsoleAndLog(text);
+}
+
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
@@ -338,6 +383,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			LogDeviceFault(graphics);
+		}
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 
