@@ -23,6 +23,7 @@
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -130,6 +131,30 @@ void DumpShader(std::span<const uint32_t> words, const std::string& name) {
 		return;
 	}
 	file.Write(words.data(), words.size_bytes());
+}
+
+// Diagnostics: always dumps the shaders being investigated to _ShaderDump, without the full
+// graphics debug dump. KYTY_DUMP_SHADER=<hex hash>[,<hex hash>...] or "all" adds more.
+bool ShaderDumpRequested(uint64_t hash) {
+	if (hash == 0x8556beb2a0abb67aull) return true;
+	static const std::string requested = [] {
+		const char* value = std::getenv("KYTY_DUMP_SHADER");
+		return std::string(value != nullptr ? value : "");
+	}();
+	if (requested.empty()) return false;
+	if (requested == "all") return true;
+	return requested.find(fmt::format("{:016x}", hash)) != std::string::npos ||
+	       requested.find(fmt::format("{:x}", hash)) != std::string::npos;
+}
+
+void DumpRequestedShader(uint64_t hash, std::span<const uint32_t> words, const std::string& name) {
+	if (!ShaderDumpRequested(hash)) return;
+	const auto path = std::filesystem::path("_ShaderDump") / name;
+	Common::File::CreateDirectories(path.parent_path());
+	Common::File file(path);
+	if (file.IsInvalid()) return;
+	file.Write(words.data(), words.size_bytes());
+	PipelineCacheLog("Shader dump: wrote {}", Common::PathToString(path));
 }
 
 void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
@@ -323,6 +348,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
+	DumpRequestedShader(key.hash, result.spirv,
+	                    fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
@@ -422,6 +449,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
 		                                    ShaderRecompiler::StageName(options.stage), params.hash));
+		DumpRequestedShader(params.hash, params.code,
+		                    fmt::format("{}_{:016x}.bin", ShaderRecompiler::StageName(options.stage),
+		                                params.hash));
 		source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		if (source.unsupported_call_pc != UINT32_MAX) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "

@@ -464,6 +464,24 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	Checkpoints::Mark(vk_buffer, 'C', program.shader_hash, 0);
+	if (program.shader_hash == 0x8556beb2a0abb67aull) {
+		// Diagnostics for the shader that hangs PPSA02530 on NVIDIA.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 4u) {
+			char line[320];
+			std::snprintf(line, sizeof(line),
+			              "Hang candidate CS 0x%016llx: groups=%ux%ux%u threads=%ux%ux%u wave=%u "
+			              "host_subgroup=%u lds_dwords=%u mode=0x%x gds=%d lds_storage=%d\n",
+			              static_cast<unsigned long long>(program.shader_hash), thread_group_x,
+			              thread_group_y, thread_group_z, input_info.threads_num[0],
+			              input_info.threads_num[1], input_info.threads_num[2],
+			              input_info.wave_size, input_info.host_subgroup_size,
+			              input_info.lds_size_dwords, mode,
+			              static_cast<int>(program.info.uses_gds),
+			              static_cast<int>(input_info.lds_storage));
+			Log::WriteToConsoleAndLog(line);
+		}
+	}
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
