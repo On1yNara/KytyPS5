@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -29,7 +30,11 @@ namespace {
 // Same approach as AnyPS5's recompiler. KYTY_NO_WAVE_LDS_BARRIERS=1 turns it off for comparison.
 uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo* workgroup,
                       uint32_t lane_count) {
-	static const bool disabled = std::getenv("KYTY_NO_WAVE_LDS_BARRIERS") != nullptr;
+	static const bool disabled = [] {
+		const bool off = std::getenv("KYTY_NO_WAVE_LDS_BARRIERS") != nullptr;
+		if (off) Log::WriteToConsoleAndLog("Shader recompiler: KYTY_NO_WAVE_LDS_BARRIERS on\n");
+		return off;
+	}();
 	if (disabled || program.stage != ShaderType::Compute || workgroup == nullptr ||
 	    workgroup->host_subgroup_size != 32u) {
 		return 0;
@@ -85,10 +90,17 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
 	// Same idea as AnyPS5's APS5_LOOP_GUARD. Mesh shaders are skipped: their SPIR-V 1.4 entry point
 	// would have to list the counter variable in its interface.
-	if (const char* guard = std::getenv("KYTY_LOOP_GUARD");
-	    guard != nullptr && program.stage != ShaderType::Mesh) {
-		state.loop_guard_limit = static_cast<uint32_t>(std::strtoul(guard, nullptr, 0));
-	}
+	static const uint32_t loop_guard = [] {
+		const char* guard = std::getenv("KYTY_LOOP_GUARD");
+		const auto  limit = guard != nullptr ? static_cast<uint32_t>(std::strtoul(guard, nullptr, 0)) : 0u;
+		if (limit != 0) {
+			char line[96];
+			std::snprintf(line, sizeof(line), "Shader recompiler: KYTY_LOOP_GUARD=%u\n", limit);
+			Log::WriteToConsoleAndLog(line);
+		}
+		return limit;
+	}();
+	if (program.stage != ShaderType::Mesh) state.loop_guard_limit = loop_guard;
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
