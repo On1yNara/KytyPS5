@@ -115,6 +115,10 @@ struct EmitterState {
 	// Execution scope of the barriers that order LDS accesses between lanes of one guest wave
 	// (0 = none). See WaveLdsScope in SpirvEmitter.cpp.
 	uint32_t                                         wave_lds_scope          = 0;
+	// Debug aid (KYTY_LOOP_GUARD=<n>): after n evaluated loop exits an invocation leaves its loops
+	// instead of hanging the GPU. 0 = off. loop_guard_visits is the Private counter variable.
+	uint32_t                                         loop_guard_limit        = 0;
+	uint32_t                                         loop_guard_visits       = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
