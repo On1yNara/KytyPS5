@@ -1,10 +1,12 @@
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <unordered_map>
 #include <utility>
 
@@ -736,6 +738,9 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
                                     IR::Block& info) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
 		// A zero kind negates the vote of the nonzero kind that follows it in the enum.
+		if (kind == CFG::BranchCondition::ExecZero && execz_never_taken) {
+			return IR::U1(IR::Value(false));
+		}
 		const bool zero = kind == CFG::BranchCondition::SccZero ||
 		                  kind == CFG::BranchCondition::VccZero ||
 		                  kind == CFG::BranchCondition::ExecZero;
@@ -1430,10 +1435,25 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
 	                              (options.input_info.compute->float_mode & 0x10u) == 0;
+	static const bool execz_barrier_fix = [] {
+		const bool enabled = std::getenv("KYTY_EXECZ_BARRIER_FIX") != nullptr;
+		if (enabled) {
+			Log::WriteToConsoleAndLog(
+			    "Shader recompiler: KYTY_EXECZ_BARRIER_FIX on (EXECZ skips kept for barriers)\n");
+		}
+		return enabled;
+	}();
+	const bool execz_never_taken =
+	    execz_barrier_fix &&
+	    (options.stage == ShaderType::Compute || options.stage == ShaderType::Mesh) &&
+	    std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
+		    return inst.opcode == Decoder::Opcode::S_BARRIER;
+	    });
 	for (const auto& cfg_block: cfg.blocks) {
 		auto*      block = blocks_by_id.at(cfg_block.id);
 		Translator translator(result, block, vector_limit, lane_spills, flush_f32_inputs,
 		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
+		translator.execz_never_taken = execz_never_taken;
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
