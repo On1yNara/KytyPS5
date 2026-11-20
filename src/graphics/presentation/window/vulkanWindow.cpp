@@ -702,6 +702,28 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		create.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
 	}
 
+	// Diagnostics only: with VK_EXT_device_fault a lost device can say which address or shader
+	// the GPU faulted on. Linked by hand at the head of the chain so it never affects devices
+	// without it.
+	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
+	if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
+		vk::PhysicalDeviceFeatures2        query {.pNext = &supported_fault};
+		physical_device.getFeatures2(&query);
+		if (supported_fault.deviceFault == VK_TRUE) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+			auto& device_info                    = create.get<vk::DeviceCreateInfo>();
+			device_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
+			device_info.ppEnabledExtensionNames = device_extensions.data();
+			fault_features.deviceFault           = VK_TRUE;
+			fault_features.deviceFaultVendorBinary = VK_FALSE;
+			fault_features.pNext                 = const_cast<void*>(device_info.pNext);
+			device_info.pNext                    = &fault_features;
+			graphics.device_fault_enabled        = true;
+		}
+	}
+	LOGF("Vulkan device fault reporting: %s\n", graphics.device_fault_enabled ? "true" : "false");
+
 	vk::Device device = nullptr;
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
 	                     "vkCreateDevice");
@@ -1077,4 +1099,4 @@ WindowContext::~WindowContext() {
 	SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
 }
 
-} // namespace Libs::Graphics
+} // namespace Libs::Graphics,
