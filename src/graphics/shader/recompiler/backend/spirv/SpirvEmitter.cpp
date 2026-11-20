@@ -94,7 +94,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	// Loop guard (see EmitterState::loop_guard_limit). Persistent GPU-culling compute shaders (as in
 	// PPSA02530) walk Hi-Z footprints with float loop counters; with an infinite projected bound
 	// the counter stops advancing and the loop never ends, which hangs the GPU (device lost). By
-	// default compute shaders get a budget of 200000 evaluated loop exits per invocation, far
+	// default compute shaders get a budget of 5000 evaluated loop exits per invocation, far
 	// beyond any finite loop they run. KYTY_LOOP_GUARD=<n> sets the budget for every stage, and
 	// KYTY_LOOP_GUARD=0 turns the guard off.
 	static const int64_t loop_guard_env = [] {
@@ -107,7 +107,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		Log::WriteToConsoleAndLog(line);
 		return limit;
 	}();
-	constexpr uint32_t DefaultComputeLoopGuard = 200000u;
+	constexpr uint32_t DefaultComputeLoopGuard = 5000u;
 	if (program.stage != ShaderType::Mesh) {
 		if (loop_guard_env >= 0) {
 			state.loop_guard_limit = static_cast<uint32_t>(loop_guard_env);
@@ -116,7 +116,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true)) {
 				Log::WriteToConsoleAndLog(
-				    "Shader recompiler: compute loop guard 200000 (KYTY_LOOP_GUARD=0 disables)\n");
+				    "Shader recompiler: compute loop guard 5000 (KYTY_LOOP_GUARD=0 disables)\n");
 			}
 		}
 	}

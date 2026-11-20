@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <unordered_map>
@@ -285,6 +286,153 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 	       });
 }
 
+namespace {
+
+// Diagnostics for PPSA02530: its GPU-culling compute shaders run a device-wide work queue and
+// spin until the queue counters (bytes 2048..2063 of the queue buffer) reach zero. This copies
+// the first 16 bytes and bytes 2048..2063 of each written buffer before and after the dispatch,
+// next to the CPU view of the same bytes, and logs them once the GPU has finished.
+bool QueueProbeShader(uint64_t hash) {
+	return hash == 0x8556beb2a0abb67aull || hash == 0xc9216bf2a1a89c28ull;
+}
+
+class QueueProbe {
+public:
+	static constexpr uint32_t Slots       = 64;
+	static constexpr uint32_t MaxBuffers  = 4;
+	static constexpr uint32_t BufferBytes = 64;
+	static constexpr uint32_t SlotBytes   = MaxBuffers * BufferBytes;
+	static constexpr uint32_t MaxProbes   = 48;
+
+	void Before(RenderContext& ctx, CommandBuffer& cmd, uint64_t hash,
+	            const ShaderComputeInputInfo& input) {
+		Drain(ctx);
+		m_active = false;
+		if (m_seq >= MaxProbes) return;
+		const uint32_t slot = m_seq % Slots;
+		auto&          p    = m_pending[slot];
+		if (p.valid) return;
+		if (m_buffer == nullptr) {
+			m_buffer = std::make_unique<Buffer>(ctx.GetGraphics(), ctx.GetCommandScheduler(),
+			                                    MemoryUsage::Download, 0,
+			                                    vk::BufferUsageFlagBits::eTransferDst,
+			                                    uint64_t {Slots} * SlotBytes);
+		}
+		const auto& program   = input.stage.module->info;
+		const auto& resources = *input.stage.resources;
+		p        = Pending {};
+		p.hash   = hash;
+		p.seq    = m_seq++;
+		m_slot   = slot;
+		m_count  = 0;
+		for (uint32_t i = 0; i < program.info.buffers.size() && m_count < MaxBuffers; i++) {
+			if (!program.info.buffers[i].written || i >= resources.buffers.size()) continue;
+			const auto r    = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			const auto base = r.Base48();
+			const auto size = static_cast<uint64_t>(r.GetSize());
+			if (base == 0 || size < 16u) continue;
+			const uint32_t k = m_count++;
+			p.addr[k]        = base;
+			p.size[k]        = size;
+			p.has_hi[k]      = size >= 2064u;
+			p.cpu_ok[k]      = LibKernel::Memory::TryReadBacking(base, &p.cpu[k][0], 16);
+			if (p.has_hi[k]) {
+				p.cpu_ok[k] = LibKernel::Memory::TryReadBacking(base + 2048u, &p.cpu[k][4], 16) &&
+				              p.cpu_ok[k];
+			}
+			const auto lo = ctx.GetBufferCache().ObtainBuffer(base, 16, false);
+			m_regions[k][0] = lo;
+			m_regions[k][1] = {nullptr, 0};
+			if (p.has_hi[k]) {
+				m_regions[k][1] = ctx.GetBufferCache().ObtainBuffer(base + 2048u, 16, false);
+			}
+		}
+		p.count  = m_count;
+		m_active = m_count != 0;
+		Copy(cmd, 0);
+	}
+
+	void After(RenderContext& ctx, CommandBuffer& cmd) {
+		if (!m_active) return;
+		Copy(cmd, 32);
+		auto& p = m_pending[m_slot];
+		p.tick  = ctx.GetCommandScheduler().CurrentTick();
+		p.valid = true;
+		m_active = false;
+	}
+
+private:
+	struct Pending {
+		bool     valid = false;
+		uint64_t hash  = 0;
+		uint64_t tick  = 0;
+		uint32_t seq   = 0;
+		uint32_t count = 0;
+		uint64_t addr[MaxBuffers] {};
+		uint64_t size[MaxBuffers] {};
+		bool     has_hi[MaxBuffers] {};
+		bool     cpu_ok[MaxBuffers] {};
+		uint32_t cpu[MaxBuffers][8] {};
+	};
+
+	void Copy(CommandBuffer& cmd, uint32_t base_offset) {
+		for (uint32_t k = 0; k < m_count; k++) {
+			for (uint32_t half = 0; half < 2u; half++) {
+				const auto [source, offset] = m_regions[k][half];
+				if (source == nullptr) continue;
+				m_buffer->CopyFrom(cmd, *source, offset,
+				                   uint64_t {m_slot} * SlotBytes + k * BufferBytes + base_offset +
+				                       half * 16u,
+				                   16);
+			}
+		}
+	}
+
+	void Drain(RenderContext& ctx) {
+		auto& semaphore = ctx.GetCommandScheduler().GetMasterSemaphore();
+		for (uint32_t slot = 0; slot < Slots; slot++) {
+			auto& p = m_pending[slot];
+			if (!p.valid || !semaphore.IsFree(p.tick)) continue;
+			const uint64_t offset = uint64_t {slot} * SlotBytes;
+			if (!m_buffer->IsCoherent()) m_buffer->Invalidate(offset, SlotBytes);
+			const auto mapped = m_buffer->Mapped();
+			for (uint32_t k = 0; k < p.count; k++) {
+				uint32_t gpu[16] {};
+				if (!mapped.empty()) {
+					std::memcpy(gpu, mapped.data() + offset + k * BufferBytes, sizeof(gpu));
+				}
+				char line[512];
+				std::snprintf(
+				    line, sizeof(line),
+				    "QueueProbe #%u CS 0x%016llx buf%u addr=0x%012llx size=%llu | cpu%s @0=%x %x %x "
+				    "%x @2048=%x %x %x %x | gpu before @0=%x %x %x %x @2048=%x %x %x %x | after "
+				    "@0=%x %x %x %x @2048=%x %x %x %x\n",
+				    p.seq, static_cast<unsigned long long>(p.hash), k,
+				    static_cast<unsigned long long>(p.addr[k]),
+				    static_cast<unsigned long long>(p.size[k]), p.cpu_ok[k] ? "" : "(n/a)",
+				    p.cpu[k][0], p.cpu[k][1], p.cpu[k][2], p.cpu[k][3], p.cpu[k][4], p.cpu[k][5],
+				    p.cpu[k][6], p.cpu[k][7], gpu[0], gpu[1], gpu[2], gpu[3], gpu[4], gpu[5],
+				    gpu[6], gpu[7], gpu[8], gpu[9], gpu[10], gpu[11], gpu[12], gpu[13], gpu[14],
+				    gpu[15]);
+				Log::WriteToConsoleAndLog(line);
+			}
+			p.valid = false;
+		}
+	}
+
+	std::unique_ptr<Buffer>                   m_buffer;
+	std::array<Pending, Slots>                m_pending {};
+	std::pair<Buffer*, uint64_t>              m_regions[MaxBuffers][2] {};
+	uint32_t                                  m_seq    = 0;
+	uint32_t                                  m_slot   = 0;
+	uint32_t                                  m_count  = 0;
+	bool                                      m_active = false;
+};
+
+QueueProbe g_queue_probe;
+
+} // namespace
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
@@ -482,6 +630,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			Log::WriteToConsoleAndLog(line);
 		}
 	}
+	const bool queue_probe = QueueProbeShader(program.shader_hash);
+	if (queue_probe) g_queue_probe.Before(m_context, buffer, program.shader_hash, input_info);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -504,6 +654,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	if (queue_probe) g_queue_probe.After(m_context, buffer);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -560,8 +711,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const bool queue_probe = QueueProbeShader(program.shader_hash);
+	if (queue_probe) g_queue_probe.Before(m_context, buffer, program.shader_hash, input_info);
 	Checkpoints::Mark(vk_buffer, 'I', program.shader_hash, 0);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	if (queue_probe) g_queue_probe.After(m_context, buffer);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
