@@ -112,6 +112,9 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	// Execution scope of the barriers that order LDS accesses between lanes of one guest wave
+	// (0 = none). See WaveLdsScope in SpirvEmitter.cpp.
+	uint32_t                                         wave_lds_scope          = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
