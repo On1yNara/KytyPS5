@@ -336,8 +336,13 @@ public:
 		p.seq    = m_seq++;
 		m_slot   = slot;
 		m_count  = 0;
+		// CS 0x11ac0502b89a6dd2 loops over a per-group object count read from a read-only buffer,
+		// so for it every buffer and the indirect arguments are copied.
+		const bool all_buffers = hash == 0x11ac0502b89a6dd2ull;
 		for (uint32_t i = 0; i < program.info.buffers.size() && m_count < MaxBuffers; i++) {
-			if (!program.info.buffers[i].written || i >= resources.buffers.size()) continue;
+			if ((!program.info.buffers[i].written && !all_buffers) || i >= resources.buffers.size()) {
+				continue;
+			}
 			const auto r    = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 			const auto base = r.Base48();
 			const auto size = static_cast<uint64_t>(r.GetSize());
@@ -360,6 +365,16 @@ public:
 			if (p.has_hi[k]) {
 				m_regions[k][1] = ctx.GetBufferCache().ObtainBuffer(base + 2048u, 16, false);
 			}
+		}
+		if (all_buffers && input.indirect_args_address != 0 && m_count < MaxBuffers) {
+			const auto     args = input.indirect_args_address;
+			const uint32_t k    = m_count++;
+			p.addr[k]           = args;
+			p.size[k]           = 12;
+			p.has_hi[k]         = false;
+			p.cpu_ok[k]         = LibKernel::Memory::TryReadBacking(args, &p.cpu[k][0], 12);
+			m_regions[k][0]     = ctx.GetBufferCache().ObtainBuffer(args, 16, false);
+			m_regions[k][1]     = {nullptr, 0};
 		}
 		p.count  = m_count;
 		m_active = m_count != 0;
@@ -430,9 +445,13 @@ private:
 			m_probes++;
 			if (interesting) m_interesting++;
 			if (stale) m_stale++;
-			uint32_t& plain = m_plain_prints[p.hash == 0x8556beb2a0abb67aull ? 0 : 1];
-			const bool print = interesting ? m_interesting_prints < MaxInterestingPrints
-			                               : plain < PlainPrintsPerShader;
+			const uint32_t shader_index = p.hash == 0x8556beb2a0abb67aull   ? 0u
+			                              : p.hash == 0xc9216bf2a1a89c28ull ? 1u
+			                                                                : 2u;
+			uint32_t&      plain        = m_plain_prints[shader_index];
+			const uint32_t plain_limit  = shader_index == 2u ? 40u : PlainPrintsPerShader;
+			const bool     print = interesting ? m_interesting_prints < MaxInterestingPrints
+			                                   : plain < plain_limit;
 			if (print) {
 				if (interesting) m_interesting_prints++; else plain++;
 				for (uint32_t k = 0; k < p.count; k++) {
@@ -472,7 +491,7 @@ private:
 	uint32_t                                  m_interesting        = 0;
 	uint32_t                                  m_stale              = 0;
 	uint32_t                                  m_interesting_prints = 0;
-	uint32_t                                  m_plain_prints[2] {};
+	uint32_t                                  m_plain_prints[3] {};
 	uint32_t                                  m_slot   = 0;
 	uint32_t                                  m_count  = 0;
 	bool                                      m_active = false;
@@ -732,7 +751,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	}
 	const bool culling_queue = CullingQueueShader(program.shader_hash);
-	const bool queue_probe   = culling_queue && QueueProbeEnabled();
+	const bool queue_probe   = (culling_queue && QueueProbeEnabled()) ||
+	                         program.shader_hash == 0x11ac0502b89a6dd2ull;
 	if (queue_probe) g_queue_probe.Before(m_context, buffer, program.shader_hash, input_info);
 	if (culling_queue) ResetCullingQueue(m_context, buffer, input_info);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
@@ -815,7 +835,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	const bool culling_queue = CullingQueueShader(program.shader_hash);
-	const bool queue_probe   = culling_queue && QueueProbeEnabled();
+	const bool queue_probe   = (culling_queue && QueueProbeEnabled()) ||
+	                         program.shader_hash == 0x11ac0502b89a6dd2ull;
 	if (queue_probe) g_queue_probe.Before(m_context, buffer, program.shader_hash, input_info);
 	if (culling_queue) ResetCullingQueue(m_context, buffer, input_info);
 	Checkpoints::Mark(vk_buffer, 'I', program.shader_hash, 0);

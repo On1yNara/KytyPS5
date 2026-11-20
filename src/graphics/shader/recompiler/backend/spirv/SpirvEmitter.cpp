@@ -115,11 +115,14 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		} else if (program.shader_hash == 0x8556beb2a0abb67aull ||
 		           program.shader_hash == 0xc9216bf2a1a89c28ull ||
 		           program.shader_hash == 0x11ac0502b89a6dd2ull) {
-			state.loop_guard_limit = CullingLoopGuard;
+			// CS 0x11ac loops at most count/512 + 1024 times when its object count is sane, so a
+			// lower budget keeps a runaway count from stalling the frame for long.
+			state.loop_guard_limit =
+			    program.shader_hash == 0x11ac0502b89a6dd2ull ? 20000u : CullingLoopGuard;
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true)) {
 				Log::WriteToConsoleAndLog(
-				    "Shader recompiler: loop guard 200000 on PPSA02530 shaders 8556/c921/11ac only\n");
+				    "Shader recompiler: loop guard on PPSA02530 shaders 8556/c921 (200000) and 11ac (20000) only\n");
 			}
 		}
 	}
