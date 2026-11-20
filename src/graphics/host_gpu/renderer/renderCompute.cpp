@@ -302,13 +302,13 @@ public:
 	static constexpr uint32_t MaxBuffers  = 4;
 	static constexpr uint32_t BufferBytes = 64;
 	static constexpr uint32_t SlotBytes   = MaxBuffers * BufferBytes;
-	static constexpr uint32_t MaxProbes   = 48;
+	static constexpr uint32_t PlainPrintsPerShader = 3;
+	static constexpr uint32_t MaxInterestingPrints = 120;
 
 	void Before(RenderContext& ctx, CommandBuffer& cmd, uint64_t hash,
 	            const ShaderComputeInputInfo& input) {
 		Drain(ctx);
 		m_active = false;
-		if (m_seq >= MaxProbes) return;
 		const uint32_t slot = m_seq % Slots;
 		auto&          p    = m_pending[slot];
 		if (p.valid) return;
@@ -331,6 +331,9 @@ public:
 			const auto base = r.Base48();
 			const auto size = static_cast<uint64_t>(r.GetSize());
 			if (base == 0 || size < 16u) continue;
+			bool duplicate = false;
+			for (uint32_t j = 0; j < m_count; j++) duplicate = duplicate || p.addr[j] == base;
+			if (duplicate) continue;
 			const uint32_t k = m_count++;
 			p.addr[k]        = base;
 			p.size[k]        = size;
@@ -396,24 +399,50 @@ private:
 			const uint64_t offset = uint64_t {slot} * SlotBytes;
 			if (!m_buffer->IsCoherent()) m_buffer->Invalidate(offset, SlotBytes);
 			const auto mapped = m_buffer->Mapped();
+			uint32_t   gpu[MaxBuffers][16] {};
+			bool       interesting = false;
 			for (uint32_t k = 0; k < p.count; k++) {
-				uint32_t gpu[16] {};
 				if (!mapped.empty()) {
-					std::memcpy(gpu, mapped.data() + offset + k * BufferBytes, sizeof(gpu));
+					std::memcpy(gpu[k], mapped.data() + offset + k * BufferBytes, sizeof(gpu[k]));
 				}
-				char line[512];
-				std::snprintf(
-				    line, sizeof(line),
-				    "QueueProbe #%u CS 0x%016llx buf%u addr=0x%012llx size=%llu | cpu%s @0=%x %x %x "
-				    "%x @2048=%x %x %x %x | gpu before @0=%x %x %x %x @2048=%x %x %x %x | after "
-				    "@0=%x %x %x %x @2048=%x %x %x %x\n",
-				    p.seq, static_cast<unsigned long long>(p.hash), k,
-				    static_cast<unsigned long long>(p.addr[k]),
-				    static_cast<unsigned long long>(p.size[k]), p.cpu_ok[k] ? "" : "(n/a)",
-				    p.cpu[k][0], p.cpu[k][1], p.cpu[k][2], p.cpu[k][3], p.cpu[k][4], p.cpu[k][5],
-				    p.cpu[k][6], p.cpu[k][7], gpu[0], gpu[1], gpu[2], gpu[3], gpu[4], gpu[5],
-				    gpu[6], gpu[7], gpu[8], gpu[9], gpu[10], gpu[11], gpu[12], gpu[13], gpu[14],
-				    gpu[15]);
+				if (!p.has_hi[k]) {
+					for (uint32_t w = 4; w < 8u; w++) gpu[k][w] = gpu[k][w + 8u] = 0u;
+				}
+				// Word 1 is the batch count of the batch buffer; words 4..7 and 12..15 are the
+				// queue counters before and after.
+				interesting = interesting || gpu[k][1] != 0u;
+				for (uint32_t w = 4; w < 8u; w++) {
+					interesting = interesting || gpu[k][w] != 0u || gpu[k][w + 8u] != 0u;
+				}
+			}
+			m_probes++;
+			if (interesting) m_interesting++;
+			uint32_t& plain = m_plain_prints[p.hash == 0x8556beb2a0abb67aull ? 0 : 1];
+			const bool print = interesting ? m_interesting_prints < MaxInterestingPrints
+			                               : plain < PlainPrintsPerShader;
+			if (print) {
+				if (interesting) m_interesting_prints++; else plain++;
+				for (uint32_t k = 0; k < p.count; k++) {
+					const auto* g = gpu[k];
+					char line[512];
+					std::snprintf(
+					    line, sizeof(line),
+					    "QueueProbe #%u%s CS 0x%016llx buf%u addr=0x%012llx size=%llu | cpu%s "
+					    "@0=%x %x %x %x @2048=%x %x %x %x | gpu before @0=%x %x %x %x @2048=%x %x %x "
+					    "%x | after @0=%x %x %x %x @2048=%x %x %x %x\n",
+					    p.seq, interesting ? " !" : "", static_cast<unsigned long long>(p.hash), k,
+					    static_cast<unsigned long long>(p.addr[k]),
+					    static_cast<unsigned long long>(p.size[k]), p.cpu_ok[k] ? "" : "(n/a)",
+					    p.cpu[k][0], p.cpu[k][1], p.cpu[k][2], p.cpu[k][3], p.cpu[k][4], p.cpu[k][5],
+					    p.cpu[k][6], p.cpu[k][7], g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+					    g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+					Log::WriteToConsoleAndLog(line);
+				}
+			}
+			if (m_probes % 500u == 0u) {
+				char line[128];
+				std::snprintf(line, sizeof(line), "QueueProbe summary: probes=%u interesting=%u\n",
+				              m_probes, m_interesting);
 				Log::WriteToConsoleAndLog(line);
 			}
 			p.valid = false;
@@ -424,6 +453,10 @@ private:
 	std::array<Pending, Slots>                m_pending {};
 	std::pair<Buffer*, uint64_t>              m_regions[MaxBuffers][2] {};
 	uint32_t                                  m_seq    = 0;
+	uint32_t                                  m_probes = 0;
+	uint32_t                                  m_interesting        = 0;
+	uint32_t                                  m_interesting_prints = 0;
+	uint32_t                                  m_plain_prints[2] {};
 	uint32_t                                  m_slot   = 0;
 	uint32_t                                  m_count  = 0;
 	bool                                      m_active = false;
