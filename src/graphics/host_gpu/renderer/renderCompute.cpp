@@ -464,10 +464,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	Checkpoints::Mark(vk_buffer, 'C', program.shader_hash, 0);
-	if (program.shader_hash == 0x8556beb2a0abb67aull) {
+	if (program.shader_hash == 0x8556beb2a0abb67aull || program.shader_hash == 0xc9216bf2a1a89c28ull) {
 		// Diagnostics for the shader that hangs PPSA02530 on NVIDIA.
 		static std::atomic<uint32_t> logged {0};
-		if (logged.fetch_add(1, std::memory_order_relaxed) < 4u) {
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
 			char line[320];
 			std::snprintf(line, sizeof(line),
 			              "Hang candidate CS 0x%016llx: groups=%ux%ux%u threads=%ux%ux%u wave=%u "

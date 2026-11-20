@@ -91,27 +91,33 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
 	// Same idea as AnyPS5's APS5_LOOP_GUARD. Mesh shaders are skipped: their SPIR-V 1.4 entry point
 	// would have to list the counter variable in its interface.
-	static const uint32_t loop_guard = [] {
+	// Loop guard (see EmitterState::loop_guard_limit). Persistent GPU-culling compute shaders (as in
+	// PPSA02530) walk Hi-Z footprints with float loop counters; with an infinite projected bound
+	// the counter stops advancing and the loop never ends, which hangs the GPU (device lost). By
+	// default compute shaders get a budget of 200000 evaluated loop exits per invocation, far
+	// beyond any finite loop they run. KYTY_LOOP_GUARD=<n> sets the budget for every stage, and
+	// KYTY_LOOP_GUARD=0 turns the guard off.
+	static const int64_t loop_guard_env = [] {
 		const char* guard = std::getenv("KYTY_LOOP_GUARD");
-		const auto  limit = guard != nullptr ? static_cast<uint32_t>(std::strtoul(guard, nullptr, 0)) : 0u;
-		if (limit != 0) {
-			char line[96];
-			std::snprintf(line, sizeof(line), "Shader recompiler: KYTY_LOOP_GUARD=%u\n", limit);
-			Log::WriteToConsoleAndLog(line);
-		}
+		if (guard == nullptr) return int64_t {-1};
+		const auto limit = static_cast<int64_t>(std::strtoul(guard, nullptr, 0));
+		char line[96];
+		std::snprintf(line, sizeof(line), "Shader recompiler: KYTY_LOOP_GUARD=%lld\n",
+		              static_cast<long long>(limit));
+		Log::WriteToConsoleAndLog(line);
 		return limit;
 	}();
-	if (program.stage != ShaderType::Mesh) state.loop_guard_limit = loop_guard;
-	// PPSA02530's persistent GPU-culling compute shader walks its Hi-Z footprint with float loop
-	// counters (x += 1.0 / x += 8.0 while x <= max). When a projected bound comes out infinite
-	// the counter stops changing and the loop never ends, hanging the GPU (device lost). Give
-	// this one shader a loop budget unless KYTY_LOOP_GUARD already set one.
-	if (state.loop_guard_limit == 0 && program.shader_hash == 0x8556beb2a0abb67aull) {
-		state.loop_guard_limit = 200000u;
-		static std::atomic_bool logged = false;
-		if (!logged.exchange(true)) {
-			Log::WriteToConsoleAndLog(
-			    "Shader recompiler: loop guard 200000 for CS 0x8556beb2a0abb67a\n");
+	constexpr uint32_t DefaultComputeLoopGuard = 200000u;
+	if (program.stage != ShaderType::Mesh) {
+		if (loop_guard_env >= 0) {
+			state.loop_guard_limit = static_cast<uint32_t>(loop_guard_env);
+		} else if (program.stage == ShaderType::Compute) {
+			state.loop_guard_limit = DefaultComputeLoopGuard;
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true)) {
+				Log::WriteToConsoleAndLog(
+				    "Shader recompiler: compute loop guard 200000 (KYTY_LOOP_GUARD=0 disables)\n");
+			}
 		}
 	}
 	DefineModule(state);
