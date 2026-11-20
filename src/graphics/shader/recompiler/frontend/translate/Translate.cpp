@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -1443,17 +1445,51 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		return enabled;
 	}();
-	const bool execz_never_taken =
-	    execz_barrier_fix &&
-	    (options.stage == ShaderType::Compute || options.stage == ShaderType::Mesh) &&
-	    std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
-		    return inst.opcode == Decoder::Opcode::S_BARRIER;
-	    });
+	// Blocks whose S_CBRANCH_EXECZ jumps forward over an S_BARRIER without leaving a loop that
+	// encloses the branch (EXECZ is also the usual loop exit, which must keep working).
+	std::unordered_set<uint32_t> execz_fallthrough_blocks;
+	if (execz_barrier_fix &&
+	    (options.stage == ShaderType::Compute || options.stage == ShaderType::Mesh)) {
+		for (const auto& cfg_block: cfg.blocks) {
+			const auto& term = cfg_block.terminator;
+			if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
+			    term.condition != CFG::BranchCondition::ExecZero ||
+			    term.expression != UINT32_MAX) {
+				continue;
+			}
+			const auto* target = cfg.FindBlock(term.true_block);
+			if (target == nullptr || target->start_pc <= cfg_block.end_pc) continue;
+			const uint32_t skip_begin = cfg_block.end_pc;
+			const uint32_t skip_end   = target->start_pc;
+			const bool     skips_barrier =
+			    std::ranges::any_of(decoded.instructions, [&](const Decoder::Instruction& inst) {
+				    return inst.opcode == Decoder::Opcode::S_BARRIER && inst.pc >= skip_begin &&
+				           inst.pc < skip_end;
+			    });
+			if (!skips_barrier) continue;
+			// A back edge from inside the skipped range to the branch or before it means the
+			// jump leaves that loop.
+			const bool loop_exit = std::ranges::any_of(cfg.back_edges, [&](const auto& edge) {
+				const auto* from = cfg.FindBlock(edge.from);
+				const auto* to   = cfg.FindBlock(edge.to);
+				return from != nullptr && to != nullptr && to->start_pc <= cfg_block.start_pc &&
+				       from->start_pc >= skip_begin && from->start_pc < skip_end;
+			});
+			if (!loop_exit) execz_fallthrough_blocks.insert(cfg_block.id);
+		}
+		if (!execz_fallthrough_blocks.empty()) {
+			char line[96];
+			std::snprintf(line, sizeof(line),
+			              "Shader recompiler: EXECZ barrier fix applied to %zu branch(es)\n",
+			              execz_fallthrough_blocks.size());
+			Log::WriteToConsoleAndLog(line);
+		}
+	}
 	for (const auto& cfg_block: cfg.blocks) {
 		auto*      block = blocks_by_id.at(cfg_block.id);
 		Translator translator(result, block, vector_limit, lane_spills, flush_f32_inputs,
 		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
-		translator.execz_never_taken = execz_never_taken;
+		translator.execz_never_taken = execz_fallthrough_blocks.contains(cfg_block.id);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
