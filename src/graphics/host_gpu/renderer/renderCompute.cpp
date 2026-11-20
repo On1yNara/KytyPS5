@@ -32,6 +32,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -303,7 +304,7 @@ public:
 	static constexpr uint32_t BufferBytes = 64;
 	static constexpr uint32_t SlotBytes   = MaxBuffers * BufferBytes;
 	static constexpr uint32_t PlainPrintsPerShader = 3;
-	static constexpr uint32_t MaxInterestingPrints = 120;
+	static constexpr uint32_t MaxInterestingPrints = 60;
 
 	void Before(RenderContext& ctx, CommandBuffer& cmd, uint64_t hash,
 	            const ShaderComputeInputInfo& input) {
@@ -401,6 +402,7 @@ private:
 			const auto mapped = m_buffer->Mapped();
 			uint32_t   gpu[MaxBuffers][16] {};
 			bool       interesting = false;
+			bool       stale       = false;
 			for (uint32_t k = 0; k < p.count; k++) {
 				if (!mapped.empty()) {
 					std::memcpy(gpu[k], mapped.data() + offset + k * BufferBytes, sizeof(gpu[k]));
@@ -408,15 +410,16 @@ private:
 				if (!p.has_hi[k]) {
 					for (uint32_t w = 4; w < 8u; w++) gpu[k][w] = gpu[k][w + 8u] = 0u;
 				}
-				// Word 1 is the batch count of the batch buffer; words 4..7 and 12..15 are the
-				// queue counters before and after.
-				interesting = interesting || gpu[k][1] != 0u;
-				for (uint32_t w = 4; w < 8u; w++) {
-					interesting = interesting || gpu[k][w] != 0u || gpu[k][w + 8u] != 0u;
+				// Words 4/5 and 12/13 are the pending-item and active-group counters of the
+				// queue before (copied ahead of the reset) and after the dispatch.
+				if (p.has_hi[k]) {
+					stale       = stale || gpu[k][4] != 0u || gpu[k][5] != 0u;
+					interesting = interesting || gpu[k][12] != 0u || gpu[k][13] != 0u;
 				}
 			}
 			m_probes++;
 			if (interesting) m_interesting++;
+			if (stale) m_stale++;
 			uint32_t& plain = m_plain_prints[p.hash == 0x8556beb2a0abb67aull ? 0 : 1];
 			const bool print = interesting ? m_interesting_prints < MaxInterestingPrints
 			                               : plain < PlainPrintsPerShader;
@@ -441,8 +444,10 @@ private:
 			}
 			if (m_probes % 500u == 0u) {
 				char line[128];
-				std::snprintf(line, sizeof(line), "QueueProbe summary: probes=%u interesting=%u\n",
-				              m_probes, m_interesting);
+				std::snprintf(line, sizeof(line),
+				              "QueueProbe summary: probes=%u stale_before_reset=%u "
+				              "not_drained_after=%u\n",
+				              m_probes, m_stale, m_interesting);
 				Log::WriteToConsoleAndLog(line);
 			}
 			p.valid = false;
@@ -455,12 +460,65 @@ private:
 	uint32_t                                  m_seq    = 0;
 	uint32_t                                  m_probes = 0;
 	uint32_t                                  m_interesting        = 0;
+	uint32_t                                  m_stale              = 0;
 	uint32_t                                  m_interesting_prints = 0;
 	uint32_t                                  m_plain_prints[2] {};
 	uint32_t                                  m_slot   = 0;
 	uint32_t                                  m_count  = 0;
 	bool                                      m_active = false;
 };
+
+// PPSA02530's culling queue (a 2064-byte buffer: 512 ring slots, then the pending-item and
+// active-group counters and the read/write positions) must be empty when these dispatches
+// start: they only finish once both counters are zero. Every dispatch that runs normally
+// starts that way, but on some frames the host copy of a reused queue buffer holds stale data
+// while guest memory reads zero, and every group spins until the loop guard stops it. Clearing
+// the queue on the GPU first gives the start state the game expects. KYTY_NO_QUEUE_RESET=1
+// turns this off.
+void ResetCullingQueue(RenderContext& ctx, CommandBuffer& cmd, const ShaderComputeInputInfo& input) {
+	static const bool disabled = [] {
+		const bool off = std::getenv("KYTY_NO_QUEUE_RESET") != nullptr;
+		Log::WriteToConsoleAndLog(off ? "Culling queue reset: off (KYTY_NO_QUEUE_RESET)\n"
+		                              : "Culling queue reset: on\n");
+		return off;
+	}();
+	if (disabled) return;
+	constexpr uint64_t QueueBytes = 2064;
+	const auto&        program    = input.stage.module->info;
+	const auto&        resources  = *input.stage.resources;
+	uint64_t           done[4] {};
+	uint32_t           done_count = 0;
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+		if (!program.info.buffers[i].written) continue;
+		const auto r    = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		const auto base = r.Base48();
+		if (base == 0 || static_cast<uint64_t>(r.GetSize()) != QueueBytes || (base & 3u) != 0) {
+			continue;
+		}
+		bool seen = false;
+		for (uint32_t j = 0; j < done_count; j++) seen = seen || done[j] == base;
+		if (seen || done_count == 4u) continue;
+		done[done_count++] = base;
+		const auto [target, offset] = ctx.GetBufferCache().ObtainBuffer(base, QueueBytes, true);
+		cmd.EndRendering();
+		const auto native = cmd.Handle();
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eShaderWrite |
+		                       vk::AccessFlagBits::eMemoryRead;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+		                       nullptr);
+		native.fillBuffer(target->Handle(), offset, QueueBytes, 0u);
+		vk::MemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+		                      vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr,
+		                       0, nullptr);
+	}
+}
 
 QueueProbe g_queue_probe;
 
@@ -665,6 +723,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	const bool queue_probe = QueueProbeShader(program.shader_hash);
 	if (queue_probe) g_queue_probe.Before(m_context, buffer, program.shader_hash, input_info);
+	if (queue_probe) ResetCullingQueue(m_context, buffer, input_info);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -746,6 +805,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	const bool queue_probe = QueueProbeShader(program.shader_hash);
 	if (queue_probe) g_queue_probe.Before(m_context, buffer, program.shader_hash, input_info);
+	if (queue_probe) ResetCullingQueue(m_context, buffer, input_info);
 	Checkpoints::Mark(vk_buffer, 'I', program.shader_hash, 0);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	if (queue_probe) g_queue_probe.After(m_context, buffer);
