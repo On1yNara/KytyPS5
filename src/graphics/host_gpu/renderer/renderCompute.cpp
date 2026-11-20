@@ -293,8 +293,18 @@ namespace {
 // spin until the queue counters (bytes 2048..2063 of the queue buffer) reach zero. This copies
 // the first 16 bytes and bytes 2048..2063 of each written buffer before and after the dispatch,
 // next to the CPU view of the same bytes, and logs them once the GPU has finished.
-bool QueueProbeShader(uint64_t hash) {
+bool CullingQueueShader(uint64_t hash) {
 	return hash == 0x8556beb2a0abb67aull || hash == 0xc9216bf2a1a89c28ull;
+}
+
+// The probe stalls the GPU around each culling dispatch, so it only runs with KYTY_QUEUE_PROBE.
+bool QueueProbeEnabled() {
+	static const bool enabled = [] {
+		const bool on = std::getenv("KYTY_QUEUE_PROBE") != nullptr;
+		if (on) Log::WriteToConsoleAndLog("Culling queue probe: on (KYTY_QUEUE_PROBE)\n");
+		return on;
+	}();
+	return enabled;
 }
 
 class QueueProbe {
@@ -412,7 +422,7 @@ private:
 				}
 				// Words 4/5 and 12/13 are the pending-item and active-group counters of the
 				// queue before (copied ahead of the reset) and after the dispatch.
-				if (p.has_hi[k]) {
+				if (p.has_hi[k] && p.size[k] == 2064u) {
 					stale       = stale || gpu[k][4] != 0u || gpu[k][5] != 0u;
 					interesting = interesting || gpu[k][12] != 0u || gpu[k][13] != 0u;
 				}
@@ -721,9 +731,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			Log::WriteToConsoleAndLog(line);
 		}
 	}
-	const bool queue_probe = QueueProbeShader(program.shader_hash);
+	const bool culling_queue = CullingQueueShader(program.shader_hash);
+	const bool queue_probe   = culling_queue && QueueProbeEnabled();
 	if (queue_probe) g_queue_probe.Before(m_context, buffer, program.shader_hash, input_info);
-	if (queue_probe) ResetCullingQueue(m_context, buffer, input_info);
+	if (culling_queue) ResetCullingQueue(m_context, buffer, input_info);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -803,9 +814,10 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	const bool queue_probe = QueueProbeShader(program.shader_hash);
+	const bool culling_queue = CullingQueueShader(program.shader_hash);
+	const bool queue_probe   = culling_queue && QueueProbeEnabled();
 	if (queue_probe) g_queue_probe.Before(m_context, buffer, program.shader_hash, input_info);
-	if (queue_probe) ResetCullingQueue(m_context, buffer, input_info);
+	if (culling_queue) ResetCullingQueue(m_context, buffer, input_info);
 	Checkpoints::Mark(vk_buffer, 'I', program.shader_hash, 0);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	if (queue_probe) g_queue_probe.After(m_context, buffer);

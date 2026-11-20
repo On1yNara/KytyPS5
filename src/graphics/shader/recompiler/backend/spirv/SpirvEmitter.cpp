@@ -91,12 +91,13 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
 	// Same idea as AnyPS5's APS5_LOOP_GUARD. Mesh shaders are skipped: their SPIR-V 1.4 entry point
 	// would have to list the counter variable in its interface.
-	// Loop guard (see EmitterState::loop_guard_limit). Persistent GPU-culling compute shaders (as in
-	// PPSA02530) walk Hi-Z footprints with float loop counters; with an infinite projected bound
-	// the counter stops advancing and the loop never ends, which hangs the GPU (device lost). By
-	// default compute shaders get a budget of 5000 evaluated loop exits per invocation, far
-	// beyond any finite loop they run. KYTY_LOOP_GUARD=<n> sets the budget for every stage, and
-	// KYTY_LOOP_GUARD=0 turns the guard off.
+	// Loop guard (see EmitterState::loop_guard_limit). PPSA02530's two GPU-culling compute
+	// shaders spin on a device-wide work queue; if the queue never drains they hang the GPU
+	// (device lost). They keep a budget of 200000 evaluated loop exits per invocation as a safety
+	// net; the queue itself is cleared before they run (see renderCompute.cpp). Other shaders run
+	// unguarded, because a small budget cuts loops that legitimately run long and corrupts the
+	// image. KYTY_LOOP_GUARD=<n> sets the budget for every compute shader instead, and
+	// KYTY_LOOP_GUARD=0 turns the guard off everywhere.
 	static const int64_t loop_guard_env = [] {
 		const char* guard = std::getenv("KYTY_LOOP_GUARD");
 		if (guard == nullptr) return int64_t {-1};
@@ -107,16 +108,17 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		Log::WriteToConsoleAndLog(line);
 		return limit;
 	}();
-	constexpr uint32_t DefaultComputeLoopGuard = 5000u;
-	if (program.stage != ShaderType::Mesh) {
+	constexpr uint32_t CullingLoopGuard = 200000u;
+	if (program.stage == ShaderType::Compute) {
 		if (loop_guard_env >= 0) {
 			state.loop_guard_limit = static_cast<uint32_t>(loop_guard_env);
-		} else if (program.stage == ShaderType::Compute) {
-			state.loop_guard_limit = DefaultComputeLoopGuard;
+		} else if (program.shader_hash == 0x8556beb2a0abb67aull ||
+		           program.shader_hash == 0xc9216bf2a1a89c28ull) {
+			state.loop_guard_limit = CullingLoopGuard;
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true)) {
 				Log::WriteToConsoleAndLog(
-				    "Shader recompiler: compute loop guard 5000 (KYTY_LOOP_GUARD=0 disables)\n");
+				    "Shader recompiler: loop guard 200000 on the PPSA02530 culling shaders only\n");
 			}
 		}
 	}
